@@ -1,0 +1,421 @@
+name: Build DanmakuS2T
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p DanmakuS2T
+          cat > DanmakuS2T/README.md <<'__EOF__'
+          # DanmakuS2T — 動畫瘋 弹幕/字幕 繁转简(LSPosed 模块)
+
+          目标应用:`tw.com.gamer.android.animad`(分析的是 1.19.7.2)
+
+          ## 原理
+          App 用 DanmakuFlameMaster 渲染弹幕。模块钩住
+          `DanmakuUtils.fillText(BaseDanmaku, CharSequence)`,在文本写入弹幕对象时转成简体;
+          再钩 `AndroidDisplayer.measure(...)` 作为兜底。转换 = 台湾词汇表 + ICU Hant-Hans。
+
+          字幕:App 播放器是 Media3(ExoPlayer),软字幕(WebVTT 等文字轨)最终经
+          `SubtitleView.setCues(List<Cue>)` 显示,模块在此把 Cue 文本转简体并保留样式。
+          **烧进画面的硬字幕是图像,不是文字,模块无法转换。**
+          判断方法:播放时看日志,若出现 `subtitle cues received` 说明该视频用的是软字幕、已被处理;
+          若字幕可见却没有这行日志,则是硬字幕。
+
+          ## 构建
+          1. Android Studio 打开本目录,Sync(需联网拉 Gradle/AGP/Xposed API)
+          2. Build > Build APK,得到 app-debug.apk 并安装
+
+          ## 使用
+          1. 设备需 root + LSPosed(或用 LSPatch 把模块嵌入目标 APK,免 root,但需重新签名,Play 更新会失效)
+          2. LSPosed 管理器启用模块,作用域勾选「動畫瘋」
+          3. 强制停止 App 后重新打开,播放有弹幕的视频
+
+          ## 排错
+          `adb logcat | grep -i DanmakuS2T`,或看 LSPosed 日志,应看到
+          `loaded into tw.com.gamer.android.animad, hooks installed = N`(N>0)。
+          N=0:说明类名/方法名在你的版本里不同,需反编译确认(jadx)。
+
+          ## 已知限制
+          - 未在真机上测试(见下)。钩子目标来自 dex 字符串表,方法签名未经反编译验证
+          - 软字幕带样式时只做逐字转换(长度不变才处理),词汇表不对带样式字幕生效
+          - 带 Span 的弹幕(表情/图片)不转换;含日文假名的整条弹幕不转换
+          - ICU 是逐字转换,词汇级差异只靠内置词表;要更好效果可换 OpenCC(tw2sp)词典
+          - 弹幕列表面板(DanmakuListBottomSheet)里的文字走普通 TextView,本版没有处理
+          __EOF__
+          mkdir -p DanmakuS2T/app
+          cat > DanmakuS2T/app/build.gradle <<'__EOF__'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.example.danmakus2t'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.danmakus2t'
+                  minSdk 24            // android.icu 需要 API 24+
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes { release { minifyEnabled false } }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          __EOF__
+          mkdir -p DanmakuS2T/app/src/main
+          cat > DanmakuS2T/app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:label="弹幕繁转简">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="把动画疯弹幕中的繁体字自动转换为简体字" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p DanmakuS2T/app/src/main/assets
+          cat > DanmakuS2T/app/src/main/assets/xposed_init <<'__EOF__'
+          com.example.danmakus2t.HookEntry
+          __EOF__
+          mkdir -p DanmakuS2T/app/src/main/java/com/example/danmakus2t
+          cat > DanmakuS2T/app/src/main/java/com/example/danmakus2t/ChineseConverter.java <<'__EOF__'
+          package com.example.danmakus2t;
+
+          import android.icu.text.Transliterator;
+          import android.text.Spannable;
+          import android.text.SpannableStringBuilder;
+          import android.text.Spanned;
+          import android.text.TextUtils;
+          import android.util.LruCache;
+
+          import java.util.HashMap;
+          import java.util.Map;
+
+          /**
+           * 繁 -> 简。两步:
+           *   1) 台湾常用词 -> 大陆常用词(最长匹配),如 軟體 -> 软件
+           *   2) ICU "Hant-Hans" 逐字转换
+           * 含日文假名的弹幕整条跳过,避免把日文原文(歌词/台词)改坏。
+           * 非 String 的 CharSequence(带 Span)原样返回。
+           */
+          public final class ChineseConverter {
+
+              private static final LruCache<String, String> CACHE = new LruCache<>(8192);
+
+              private static final ThreadLocal<Transliterator> TL = new ThreadLocal<Transliterator>() {
+                  @Override protected Transliterator initialValue() {
+                      try { return Transliterator.getInstance("Hant-Hans"); }
+                      catch (Throwable t) { return null; }
+                  }
+              };
+
+              private static final Map<String, String> PHRASES = new HashMap<>();
+              private static int maxPhraseLen = 1;
+              static {
+                  String[] kv = {
+                      "軟體", "软件", "硬體", "硬件", "網路", "网络", "網際網路", "互联网",
+                      "影片", "视频", "視訊", "视频", "資訊", "信息", "訊息", "消息",
+                      "程式", "程序", "滑鼠", "鼠标", "螢幕", "屏幕", "記憶體", "内存",
+                      "伺服器", "服务器", "品質", "质量", "預設", "默认", "隨身碟", "U盘",
+                      "簡訊", "短信", "行動電話", "手机", "計程車", "出租车", "捷運", "地铁",
+                      "腳踏車", "自行车", "馬鈴薯", "土豆", "優格", "酸奶", "鳳梨", "菠萝",
+                      "宅配", "快递", "外帶", "外卖", "便當", "盒饭", "冰淇淋", "冰淇淋",
+                      "布丁", "布丁", "打印機", "打印机", "印表機", "打印机", "筆電", "笔记本",
+                      "解析度", "分辨率", "頻寬", "带宽", "網址", "网址", "部落格", "博客",
+                      "臉書", "脸书", "推特", "推特", "越南", "越南"
+                  };
+                  for (int i = 0; i < kv.length; i += 2) {
+                      PHRASES.put(kv[i], kv[i + 1]);
+                      maxPhraseLen = Math.max(maxPhraseLen, kv[i].length());
+                  }
+              }
+
+              private ChineseConverter() {}
+
+              public static CharSequence convert(CharSequence in) {
+                  if (!(in instanceof String)) return in;
+                  return convert((String) in);
+              }
+
+              public static String convert(String s) {
+                  if (s == null || s.isEmpty()) return s;
+                  if (!hasCjk(s) || hasKana(s)) return s;
+                  String hit = CACHE.get(s);
+                  if (hit != null) return hit;
+                  String r = applyPhrases(s);
+                  Transliterator t = TL.get();
+                  if (t != null) {
+                      try { r = t.transliterate(r); } catch (Throwable ignored) {}
+                  }
+                  CACHE.put(s, r);
+                  return r;
+              }
+
+
+              /**
+               * 字幕用:支持带样式(Spanned)的文本。
+               * 带样式时只做逐字转换(长度不变),再把原有 Span 原样复制过去;
+               * 若转换后长度变了则放弃,保持原文,避免 Span 错位。
+               */
+              public static CharSequence convertStyled(CharSequence in) {
+                  if (in == null || in.length() == 0) return in;
+                  if (in instanceof String) return convert((String) in);
+                  String plain = in.toString();
+                  if (!hasCjk(plain) || hasKana(plain)) return in;
+                  Transliterator t = TL.get();
+                  if (t == null) return in;
+                  String r;
+                  try { r = t.transliterate(plain); } catch (Throwable e) { return in; }
+                  if (r.equals(plain) || r.length() != plain.length()) return in;
+                  if (in instanceof Spanned) {
+                      SpannableStringBuilder out = new SpannableStringBuilder(r);
+                      TextUtils.copySpansFrom((Spanned) in, 0, in.length(), Object.class, out, 0);
+                      return out;
+                  }
+                  return r;
+              }
+
+              private static String applyPhrases(String s) {
+                  StringBuilder sb = null;
+                  int n = s.length(), i = 0;
+                  while (i < n) {
+                      String rep = null;
+                      int len = 0;
+                      for (int l = Math.min(maxPhraseLen, n - i); l >= 2; l--) {
+                          String r = PHRASES.get(s.substring(i, i + l));
+                          if (r != null) { rep = r; len = l; break; }
+                      }
+                      if (rep != null) {
+                          if (sb == null) { sb = new StringBuilder(n); sb.append(s, 0, i); }
+                          sb.append(rep);
+                          i += len;
+                      } else {
+                          if (sb != null) sb.append(s.charAt(i));
+                          i++;
+                      }
+                  }
+                  return sb == null ? s : sb.toString();
+              }
+
+              private static boolean hasCjk(String s) {
+                  for (int i = 0; i < s.length(); i++) {
+                      char c = s.charAt(i);
+                      if (c >= 0x3400 && c <= 0x9FFF) return true;
+                  }
+                  return false;
+              }
+
+              private static boolean hasKana(String s) {
+                  for (int i = 0; i < s.length(); i++) {
+                      char c = s.charAt(i);
+                      if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x31F0 && c <= 0x31FF)) return true;
+                  }
+                  return false;
+              }
+          }
+          __EOF__
+          mkdir -p DanmakuS2T/app/src/main/java/com/example/danmakus2t
+          cat > DanmakuS2T/app/src/main/java/com/example/danmakus2t/HookEntry.java <<'__EOF__'
+          package com.example.danmakus2t;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
+
+          /**
+           * 动画疯(tw.com.gamer.android.animad)弹幕繁转简。
+           * 该 App 使用 DanmakuFlameMaster(master.flame.danmaku),类名未混淆。
+           *
+           * 钩子 1(主):DanmakuUtils.fillText(BaseDanmaku, CharSequence)
+           *            弹幕文本入库的唯一入口,在这里转换,后续测量/绘制/换行拆分全部拿到简体。
+           * 钩子 3(字幕):Media3 SubtitleView.setCues(List<Cue>),转换软字幕。
+           * 钩子 2(兜底):AndroidDisplayer.measure(BaseDanmaku, boolean)
+           *            如果有弹幕绕过 fillText 直接写 text 字段,则在测量前补转。
+           */
+          public class HookEntry implements IXposedHookLoadPackage {
+
+              private static final String TAG = "DanmakuS2T";
+              private static final String TARGET_PKG = "tw.com.gamer.android.animad";
+              private static final String CLS_UTILS = "master.flame.danmaku.danmaku.util.DanmakuUtils";
+              private static final String CLS_DISPLAYER = "master.flame.danmaku.danmaku.model.android.AndroidDisplayer";
+              private static final String CLS_BASE = "master.flame.danmaku.danmaku.model.BaseDanmaku";
+
+              private static boolean fieldErrorLogged = false;
+
+              @Override
+              public void handleLoadPackage(LoadPackageParam lp) {
+                  if (!TARGET_PKG.equals(lp.packageName)) return;
+                  ClassLoader cl = lp.classLoader;
+                  int hooked = 0;
+                  try { hooked += hookFillText(cl); } catch (Throwable t) { log("fillText hook failed", t); }
+                  try { hooked += hookMeasure(cl); } catch (Throwable t) { log("measure hook failed", t); }
+                  try { hooked += hookSubtitles(cl); } catch (Throwable t) { log("subtitle hook failed", t); }
+                  XposedBridge.log(TAG + ": loaded into " + lp.packageName + ", hooks installed = " + hooked);
+              }
+
+              private int hookFillText(ClassLoader cl) {
+                  Class<?> c = XposedHelpers.findClassIfExists(CLS_UTILS, cl);
+                  if (c == null) { XposedBridge.log(TAG + ": " + CLS_UTILS + " not found"); return 0; }
+                  return XposedBridge.hookAllMethods(c, "fillText", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          for (int i = 0; i < p.args.length; i++) {
+                              if (p.args[i] instanceof CharSequence) {
+                                  p.args[i] = ChineseConverter.convert((CharSequence) p.args[i]);
+                              }
+                          }
+                      }
+                  }).size();
+              }
+
+              private int hookMeasure(ClassLoader cl) {
+                  final Class<?> base = XposedHelpers.findClassIfExists(CLS_BASE, cl);
+                  Class<?> c = XposedHelpers.findClassIfExists(CLS_DISPLAYER, cl);
+                  if (base == null || c == null) { XposedBridge.log(TAG + ": displayer/base class not found"); return 0; }
+                  return XposedBridge.hookAllMethods(c, "measure", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          for (Object a : p.args) {
+                              if (a != null && base.isInstance(a)) { convertDanmakuFields(a); break; }
+                          }
+                      }
+                  }).size();
+              }
+
+              /** 只处理纯 String;带 Span 的弹幕(表情/图片)保持原样,避免丢失样式。 */
+              private static void convertDanmakuFields(Object danmaku) {
+                  try {
+                      Object t = XposedHelpers.getObjectField(danmaku, "text");
+                      if (t instanceof String) {
+                          String src = (String) t;
+                          String dst = ChineseConverter.convert(src);
+                          if (!dst.equals(src)) {
+                              XposedHelpers.setObjectField(danmaku, "text", dst);
+                              Object lines = XposedHelpers.getObjectField(danmaku, "lines");
+                              if (lines instanceof String[]) {
+                                  String[] arr = (String[]) lines;
+                                  for (int i = 0; i < arr.length; i++) arr[i] = ChineseConverter.convert(arr[i]);
+                              }
+                          }
+                      }
+                  } catch (Throwable t) {
+                      if (!fieldErrorLogged) { fieldErrorLogged = true; log("field access failed", t); }
+                  }
+              }
+
+              // ------------------------------------------------------------------
+              // 软字幕(Media3 文字轨,如 WebVTT):钩住 SubtitleView.setCues(List<Cue>)
+              // 所有文字轨字幕最终都从这里进入显示;Media3 类用反射访问,不需要编译期依赖。
+              // 注意:烧进视频画面的硬字幕不是文字,这里改不了。
+              // ------------------------------------------------------------------
+              private static boolean cueLogged = false;
+
+              private int hookSubtitles(final ClassLoader cl) {
+                  Class<?> view = XposedHelpers.findClassIfExists("androidx.media3.ui.SubtitleView", cl);
+                  final Class<?> cueCls = XposedHelpers.findClassIfExists("androidx.media3.common.text.Cue", cl);
+                  if (view == null || cueCls == null) { XposedBridge.log(TAG + ": SubtitleView/Cue not found"); return 0; }
+                  return XposedBridge.hookAllMethods(view, "setCues", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          for (int i = 0; i < p.args.length; i++) {
+                              if (p.args[i] instanceof List) {
+                                  p.args[i] = convertCues((List<?>) p.args[i], cueCls);
+                              }
+                          }
+                      }
+                  }).size();
+              }
+
+              private static List<?> convertCues(List<?> src, Class<?> cueCls) {
+                  if (src == null || src.isEmpty()) return src;
+                  try {
+                      if (!cueLogged) { cueLogged = true; XposedBridge.log(TAG + ": subtitle cues received (soft subtitles in use)"); }
+                      List<Object> out = new ArrayList<>(src.size());
+                      boolean changed = false;
+                      for (Object cue : src) {
+                          Object nc = cue;
+                          if (cue != null && cueCls.isInstance(cue)) {
+                              CharSequence text = (CharSequence) XposedHelpers.getObjectField(cue, "text");
+                              CharSequence conv = ChineseConverter.convertStyled(text);
+                              if (conv != text) {
+                                  Object builder = XposedHelpers.callMethod(cue, "buildUpon");
+                                  XposedHelpers.callMethod(builder, "setText", conv);
+                                  nc = XposedHelpers.callMethod(builder, "build");
+                                  changed = true;
+                              }
+                          }
+                          out.add(nc);
+                      }
+                      return changed ? out : src;
+                  } catch (Throwable t) {
+                      log("convertCues failed", t);
+                      return src;
+                  }
+              }
+
+              private static void log(String msg, Throwable t) {
+                  XposedBridge.log(TAG + ": " + msg + " -> " + t);
+              }
+          }
+          __EOF__
+          mkdir -p DanmakuS2T/app/src/main/res/values
+          cat > DanmakuS2T/app/src/main/res/values/arrays.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>tw.com.gamer.android.animad</item>
+              </string-array>
+          </resources>
+          __EOF__
+          mkdir -p DanmakuS2T
+          cat > DanmakuS2T/build.gradle <<'__EOF__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __EOF__
+          mkdir -p DanmakuS2T
+          cat > DanmakuS2T/settings.gradle <<'__EOF__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://api.xposed.info/' }
+              }
+          }
+          rootProject.name = 'DanmakuS2T'
+          include ':app'
+          __EOF__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build APK
+        working-directory: DanmakuS2T
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DanmakuS2T-apk
+          path: DanmakuS2T/app/build/outputs/apk/debug/app-debug.apk
